@@ -14,7 +14,8 @@ from util import extract_features,utils
 
 IMG_DIR="/home/zhangao/projects/face-attack/dataset/securityAI_round1_dirimages"
 ID_DIR="/home/zhangao/projects/face-attack/dataset/securityAI_round1_dirimages"
-ADV_DIR='/home/zhangao/projects/face-attack/dataset/pgd_Linf_eps8_iter10_ens4'
+ADV_DIR='/home/zhangao/projects/face-attack/dataset/pgd_Linf_eps12_iter20_ens4mask'
+MASK_DIR='/home/zhangao/projects/face-attack/dataset/securityAI_round1_mask'
 
 if not os.path.exists(ADV_DIR):
     os.mkdir(ADV_DIR)
@@ -32,12 +33,12 @@ model_list = [ResNet_50([112,112]),
               IR_50([112,112]),
               IR_152([112,112])
               ]
-
+weights = []
 LOAD_EMBEDDINGS=None
 #LOAD_EMBEDDINGS="id_embeddings_rgb.pkl"
 PIN_MEMORY=False
 NUM_WORKERS=0
-BATCH_SIZE=2
+BATCH_SIZE=8
 EMBEDDING_SIZE = 512
 SAVE = True
 
@@ -60,6 +61,7 @@ loader = torch.utils.data.DataLoader(
 
 # Attacking Images batch-wise
 def attack(model_list,  img, label, id_embeddings_list, eps, attack_type, iters,device,target_or_not,target_index):
+    #model_list=model_list[1:]
     adv = img.detach()
     adv.requires_grad = True
 
@@ -104,12 +106,61 @@ def attack(model_list,  img, label, id_embeddings_list, eps, attack_type, iters,
         adv.grad.data.zero_()
     return adv.detach()
 
+# Attacking Images batch-wise
+def attack_in_mask(model_list,  img, label,mask, id_embeddings_list, eps, attack_type, iters,device,target_or_not,target_index):
+    #model_list=model_list[1:]
+    adv = img.detach()
+    adv.requires_grad = True
+
+    if target_or_not:
+        flag = -1
+    else:
+        flag = 1
+    
+    if attack_type == 'fgsm':
+        iterations = 1
+    else:
+        iterations = iters
+
+    if attack_type == 'pgd':
+        step = 2 / 255
+    else:
+        step = eps / iterations  
+        noise = 0
+        
+    for j in range(iterations):
+        loss=0
+        for model,id_embeddings in zip(model_list,id_embeddings_list):
+            features = extract_features.l2_normlize(model(utils.normalize(adv.clone())))
+            loss = loss + utils.distance_loss(id_embeddings,features,target_index,device)
+            #losses.append(utils.distance_loss(id_embeddings,features,target_index,device))
+        #loss = torch.sum(torch.cat(losses))
+        loss.backward()
+        if attack_type == 'mim':
+            adv_mean= torch.mean(torch.abs(adv.grad), dim=1,  keepdim=True)
+            adv_mean= torch.mean(torch.abs(adv_mean), dim=2,  keepdim=True)
+            adv_mean= torch.mean(torch.abs(adv_mean), dim=3,  keepdim=True)
+            adv.grad = adv.grad / adv_mean
+            noise = noise + adv.grad
+        else:
+            noise = adv.grad
+        # Optimization step
+        adv.data = adv.data + flag * step * noise.sign()
+        if attack_type == 'pgd':
+            adv.data = torch.where(adv.data > img.data + eps, img.data + eps, adv.data)
+            adv.data = torch.where(adv.data < img.data - eps, img.data - eps, adv.data)
+            adv.data = adv.data * mask + img.data * (1-mask)
+        adv.data.clamp_(0.0, 1.0)
+        adv.grad.data.zero_()
+    return adv.detach()
+
 # if  not LOAD_EMBEDDINGS==None:
 #     fr = open(LOAD_EMBEDDINGS,'rb')
 #     id_embeddings,id_name_to_index,id_index_to_name = pickle.load(fr)
 
 # else:
-carray,id_name_to_index,id_index_to_name = utils.read_identities(ID_DIR)
+carray,id_name_to_index,id_index_to_name,maskarray = utils.read_identities(ID_DIR,MASK_DIR)
+maskarray = torch.from_numpy(maskarray).float().to(device)
 id_embeddings_list = []
 for model in model_list:
     id_embeddings_list.append(extract_features.generate_id_embeddings(MULTIGPU,device,EMBEDDING_SIZE,BATCH_SIZE,model,carray))
@@ -133,7 +184,7 @@ for i, (img, label) in enumerate(tqdm(loader)):
     batch_target_index = target_index[i*BATCH_SIZE:i*BATCH_SIZE+len(label.numpy())]
     batch_untarget_index = untarget_index[i*BATCH_SIZE:i*BATCH_SIZE+len(label.numpy())]
     img = img.to(device)
-    
+    batch_mask = maskarray[batch_untarget_index]
     #print(img.numpy().shape)
     # for k,(model,id_embeddings_t) in enumerate(zip(model_list,id_embeddings_t_lists)):
     #     features =extract_features.l2_normlize( model(utils.normalize(img.clone().detach())))
@@ -146,7 +197,9 @@ for i, (img, label) in enumerate(tqdm(loader)):
     #             pred[j] = dataset.class_to_idx[id_index_to_name[index]]
     #     clean_acc[k] += np.sum(pred==label.numpy())
     
-    adv= attack(model_list, img, label,id_embeddings_list, eps=eps, attack_type= 'pgd', iters= 10,device=device, target_or_not=False, target_index=batch_untarget_index)
+    adv= attack(model_list, img, label,id_embeddings_list, eps=eps, attack_type= 'pgd', iters= 20,device=device, target_or_not=False, target_index=batch_untarget_index)
+    adv= attack_in_mask(model_list, img, label,batch_mask, id_embeddings_list, eps=eps, attack_type= 'pgd', iters= 20,device=device, target_or_not=False, target_index=batch_untarget_index)
+    
     if SAVE:
         for j,arr in enumerate(adv.clone().detach().cpu().numpy()): 
             dataset.samples[i*BATCH_SIZE+j][0].split('/')[-1]
